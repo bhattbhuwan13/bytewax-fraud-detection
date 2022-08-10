@@ -41,7 +41,8 @@ flow = Dataflow()
 flow.stateful_map(
     "fraud", lambda key: FraudTransaction(), FraudTransaction.detect_fraud
 )
+flow.reduce_epoch(lambda x, y: y)
 flow.capture()
 
 for epoch, item in run(flow, load_json()):
-    print(item)
+    print(epoch, item)
