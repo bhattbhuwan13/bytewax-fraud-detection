@@ -51,7 +51,7 @@ The process involves three steps:
 3. Fraud identification using bytewax  
 
 ### Data Creation
-For this tutorial, you can either create your own dataset usign the following code snippet.  
+For this tutorial, you can either create your own dataset usign the following code snippet or download the final dataset from [here](./mydata.json).  
 ```python
 import random
 from datetime import datetime
@@ -95,14 +95,126 @@ customers_df.to_csv("data.csv", index=False)
 The above code uses [`Faker`](https://faker.readthedocs.io/en/master/) package to create a dummy dataset for 100 users with 7 transctions each. A sample of generated dataset is shown below:  
 
 | id | Transaction_time | Amount_spent |
-|----|------------------|--------------|
+|:--:|:----------------:|:------------:|
 | 0  | 2021-01-03       | 25805.2      |
 | 0  | 2021-01-05       | 70036.98     |
 | 1  | 2021-01-05       | 41132.61     |
 | 1  | 2021-01-0        | 89545.87     |
-After generating the dataset, sort them by id and date and convert it to json using a [converter](https://www.convertcsv.com/csv-to-json.htm). This step is necessary to later process data sequentially for each user. You can also download the final dataset from [here](./mydata.json).
+
+After generating the dataset, sort them by id and date and convert it to json using a [converter](https://www.convertcsv.com/csv-to-json.htm). This step is necessary to later process data sequentially for each user.
 ### Rules for fraud identification
 For the sake of convinience, the tutorial defines potential fraudulent transactions as:
-1. Transactions whose amount is higher by 50% or more of the previous transactions, and
+1. Transactions whose amount is higher by at least 50% of the immediate previous transaction, and
 2. Three or more transactions for a given day/date
-### Using Bytewax for fraud identification
+
+For example, if a user spends $1000 on day 1, and $1500 on day 2, since the expenditure on day 2 is higher by 50% than the expenditure on day 1, according to our rules, the transaction for 2 will be flagged as fraudulent. Similarly, if a user makes 3 transactions on the same day, the third and later transactions are flagged as fraudulent.
+### Fraud identification using bytewax
+
+Now that you have a sample dataset you can work with, let us create fraud identification using bytewax. 
+
+First, import the following libraries and methods:
+- `json`: for reading json data
+- `Dataflow`: To create a bytewax dataflow graph
+- `run`: To pass the data into the dataflow graph and obtain output
+```python
+import json
+from bytewax import Dataflow, run
+```
+In order to simulate a streaming data source, create a generator function that returns:
+- Epoch number: You can use the "id" from the data as epoch id. 
+- Data: The data is a tuple containing a key and a value. In the code below, `id` is key and `Transaction_time` and `Amount_spent` are values.
+
+
+```python
+def load_json(file_name="mydata.json"):
+    with open(file_name, "r") as open_file:
+        for row in json.load(open_file):
+            value = (
+                str(row["id"]),
+                (
+                    row["Transaction_time"],
+                    int(row["Amount_spent"]),
+                ),
+            )
+
+            yield row["id"], value
+```
+To identify transactions whose amount is higher by at least 50% of the immediate previous transaction, create a function `current_transaction_amount_abnormally_higher` as below:
+
+```python
+def current_transaction_amount_abnormally_higher(
+    current_amount, previous_amount
+):
+    return current_amount >= 1.5 * previous_amount
+```
+Create a class `FraudTransaction` that flags fraudulent transactions using the above rules.
+
+```python
+class FraudTransaction:
+    def __init__(self):
+        self.previous_transaction_value = float("inf")
+        self.current_transaction_value = None
+        self.flagged_items = []
+        self.num_of_one_day_transactions = 1
+        self.previous_transaction_date = None
+
+    def detect_fraud(self, data):
+
+        self.current_transaction_value = data[1]
+
+        if current_transaction_amount_abnormally_higher(
+            self.current_transaction_value, self.previous_transaction_value
+        ):
+            self.flagged_items.append(data)
+            
+        # Finding three or more transactions on the same date
+        current_transaction_date = data[0]
+
+        if current_transaction_date == self.previous_transaction_date:
+            self.num_of_one_day_transactions += 1
+        else:
+            self.previous_transaction_date = current_transaction_date
+            self.num_of_one_day_transactions = 1
+
+        if self.num_of_one_day_transactions >= 3:
+            self.flagged_items.append(data)
+
+        self.previous_transaction_value = self.current_transaction_value
+        return self, self.flagged_items
+
+```
+The `detect_fraud()` method identifies the fraudulent transactions and stores then in the `flagged_items` list. 
+
+Now, create the flow for the bytewax. The flow consists of steps that are executed sequentially to produce the final output. The final ouput in this case is the standard output containing user id and a corresponding list of flagged transactions. 
+
+```python
+flow = Dataflow()
+
+flow.stateful_map(
+    "fraud", lambda key: FraudTransaction(), FraudTransaction.detect_fraud
+)
+flow.reduce_epoch(lambda x, y: y)
+flow.capture()
+
+
+```
+Every flow starts with the initialization step `flow = Dataflow()` and ends with `flow.capture()`. The `stateful_map()` is a bytewax function that allows us to perform one-to-one transformation of values in (key, value) pairs while maintaining a persistent state for eacy key when doing the transformation. In this case, the `stateful_map()` function allows us to compare the current transaction date and amount with prior ones. The `stateful_map()` takes two arguments:  
+- Builder function: It gets evoked for each new key(in our case the user id). In the above example, the initializer of the `FraudTransaction` class is the builder function.
+- Mapper function: It gets invoked for each new data point. In the above example, the `fraud_detect()`method inside the `FraudTransaction` is the mapper function.
+Finally, we can run the flow using a for loop.
+
+```python
+for epoch, item in run(flow, load_json()):
+    print(epoch, item)
+```
+Upon running the above code, we get user id and a corresponding list containing flagged transactions.
+
+**Sample Output**   
+
+```bash
+0 ('0', [('2021-01-03', 93129), ('2021-01-07', 63656)])
+1 ('1', [('2021-01-04', 34400), ('2021-01-05', 77828)])
+2 ('2', [('2021-01-07', 71674), ('2021-01-07', 80847)])
+3 ('3', [])
+4 ('4', [('2021-01-04', 99308), ('2021-01-07', 73604), ('2021-01-07', 5190)])
+```
